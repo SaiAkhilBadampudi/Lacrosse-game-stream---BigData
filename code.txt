@@ -1,0 +1,157 @@
+1)
+select t.`name` as `team Name`
+    ,t.`wins`
+    ,t.`losses`
+    ,p.`name` as `Player Name`
+    ,p.`shots` as `Player Shots`
+    , p.`goals` as `Player Goals` 
+    from mssql.`players` as p
+join mssql.`teams` as t on t.`id` = p.`teamid`
+--sbadampu
+
+2)
+select columns[0] as `id`
+    , columns[1] as `timestamp`
+    , columns[2] as `teamId`
+    , columns[3] as `playerNumber`
+    , columns[4] as `goal` 
+from minio.`gamestream.txt`
+--sbadampu
+
+3)
+gs = spark.read.option("delimiter", " ").csv("s3a://gamestreams/gamestream.txt").toDF("id","timestamp","teamid","playernumber","goal")
+gs.printSchema()
+gs.show()
+#sbadampu
+
+4)
+#gsv = gs.createOrReplaceTempView("gamestream")
+query = '''
+select id,timestamp,teamid,playernumber,cast(goal as int) from gamestream
+'''
+
+team = spark.sql(query)
+team.printSchema()
+team.show(5) 
+
+team.createOrReplaceTempView("shots")
+query1 = '''
+with teamgoal as (
+select teamid,
+    playernumber,
+    goal,
+    sum(goal)over(partition by teamid sort by teamid) as team_goals
+    from shots)
+select teamid,playernumber,count(goal) as shots,sum(goal) as goals,team_goals from teamgoal
+group by teamid,team_goals,playernumber
+'''
+shots = spark.sql(query1)
+shots.show() 
+#sbadampu
+
+5)
+#gs = spark.read.option("delimiter", " ").csv("s3a://gamestreams/gamestream.txt").toDF("id","timestamp","teamid","playernumber","goal")
+#gs.printSchema()
+#gs.show()
+#sbadampu
+#gsv = gs.createOrReplaceTempView("gamestream")
+current = spark.sql('''with game as(
+    select (select  id  from shots order by timestamp asc limit(1)) as event_id,
+        (select  timestamp  from shots order by timestamp asc limit(1)) as timestamp,
+        teamid,
+        playernumber,
+        goal,
+        sum(goal)over(partition by teamid sort by teamid) as team_goals
+    from shots)
+    select event_id,
+        timestamp,
+        teamid,
+        playernumber,
+        count(goal) as shots,
+        sum(goal) as goals,
+        team_goals
+    from game
+group by teamid,team_goals,playernumber,event_id,timestamp
+          ''')  
+current.show()       #sbadampu
+		  
+6)
+# HOW TO READ FROM MSSQL
+player2 = spark.read.format("com.microsoft.sqlserver.jdbc.spark") \
+    .option("driver", "com.microsoft.sqlserver.jdbc.SQLServerDriver") \
+    .option("url", mssql_url) \
+    .option("dbtable", "players") \
+    .option("user", mssql_user) \
+    .option("password", mssql_pw) \
+    .load()
+
+player2.createOrReplaceTempView("player")
+
+team2 = spark.read.format("com.microsoft.sqlserver.jdbc.spark") \
+    .option("driver", "com.microsoft.sqlserver.jdbc.SQLServerDriver") \
+    .option("url", mssql_url) \
+    .option("dbtable", "teams") \
+    .option("user", mssql_user) \
+    .option("password", mssql_pw) \
+    .load()
+team2.createOrReplaceTempView("team")
+
+cg = current.createOrReplaveTempView("current")	  
+
+query2 = '''
+select event_id,timestamp,pt.teamid,conference,cast(wins as int),cast(losses as int),cast(team_goals as int),
+case
+    when pt.teamid = 101 then 'home'
+    else'away'
+    end as team,
+id,name,cast(shots as int),cast(goals as int),round((goals/shots),2) as pct,c.status from current c 
+join (select p.id,p.name,number,teamid,t.conference,t.wins,t.losses from player p
+    join team t on p.teamid = t.id) pt on c.teamid = pt.teamid and c.playernumber = pt.number
+'''
+sb = spark.sql(query2)
+sb.show()
+
+
+7)
+from pyspark.sql.functions import col, lit, struct, array
+home_df = sb.filter(col("teamid") == 101)
+away_df = sb.filter(col("teamid") == 205)
+home_players_df = home_df.select("id", "name", "shots", "goals", "pct")
+away_players_df = away_df.select("id", "name", "shots", "goals", "pct")
+
+def create_player_row(row):
+    return struct(col("id").alias("id"), col("name").alias("name"), col("shots").alias("shots"), col("goals").alias("goals"), col("pct").alias("pct"))
+
+home_players = home_players_df.select("id", "name", "shots", "goals", "pct").toJSON().collect()
+away_players = away_players_df.select("id", "name", "shots", "goals", "pct").toJSON().collect()
+
+home_team = {
+    "teamid": home_df.select("teamid").first()[0],
+    "conference": home_df.select("conference").first()[0],
+    "wins": home_df.select("wins").first()[0],
+    "losses": home_df.select("losses").first()[0],
+    "score": home_df.select("team_goals").first()[0],
+    "status": home_df.select("status").first()[0],
+    "players": home_players
+}
+
+away_team = {
+    "teamid": away_df.select("teamid").first()[0],
+    "conference": away_df.select("conference").first()[0],
+    "wins": away_df.select("wins").first()[0],
+    "losses": away_df.select("losses").first()[0],
+    "score": away_df.select("team_goals").first()[0],
+    "status": away_df.select("status").first()[0],
+    "players": away_players
+}
+
+# Create final dictionary
+final_dict = {
+    "_id": sb.select("event_id").first()[0],
+    "timestamp": sb.select("timestamp").first()[0],
+    "home": home_team,
+    "away": away_team
+}
+
+# Print the final dictionary
+print(final_dict)
